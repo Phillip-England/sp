@@ -502,13 +502,44 @@ func TestTUIRenderShowsNumberedIdeasAndHelp(t *testing.T) {
 	got := model.render(100, 12, terminalStyle{})
 	for _, expected := range []string{
 		"sp tui 2 ideas mode: READ",
-		"n new  r read  c copy  d delete  f find",
+		"n new  r read  c copy  C copy all  d delete  f find  s scan paths",
 		">  2. new",
 		"   1. old",
 	} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("tui render missing %q:\n%s", expected, got)
 		}
+	}
+}
+
+func TestTUIAddsSystemScanPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "projects")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	model := tuiModel{}
+	model, _ = updateTUI(model, "s")
+	for _, r := range root {
+		model, _ = updateTUI(model, string(r))
+	}
+	model, _ = updateTUI(model, "\r")
+
+	if model.mode != tuiModeRead {
+		t.Fatalf("mode = %q, want read", model.mode)
+	}
+	if len(model.scanPaths) != 1 || model.scanPaths[0] != root {
+		t.Fatalf("scan paths = %#v, want %q", model.scanPaths, root)
+	}
+
+	settings, err := loadSystemSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settings.ScanPaths) != 1 || settings.ScanPaths[0] != root {
+		t.Fatalf("saved scan paths = %#v, want %q", settings.ScanPaths, root)
 	}
 }
 
@@ -664,6 +695,59 @@ created_at: "2026-06-15T12:35:00Z"
 	}
 	if got[1].Name != "20260615-123456-a.md" || got[1].Dir != filepath.Join(root, "a") {
 		t.Fatalf("second global file = %#v", got[1])
+	}
+}
+
+func TestGlobalSpecMarkdownFilesUsesConfiguredScanPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	rootA := filepath.Join(home, "a")
+	rootB := filepath.Join(home, "b")
+	projectA := filepath.Join(rootA, "project", ".sp")
+	projectB := filepath.Join(rootB, "project", ".sp")
+	if err := os.MkdirAll(projectA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projectB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectA, "20260615-123456-a.md"), []byte("# A\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectB, "20260615-123500-b.md"), []byte("# B\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSystemSettings(systemSettings{ScanPaths: []string{rootA}}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := globalSpecMarkdownFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "20260615-123456-a.md" || got[0].Dir != filepath.Join(rootA, "project") {
+		t.Fatalf("global configured files = %#v, want only root A", got)
+	}
+}
+
+func TestGlobalSpecMarkdownFilesWithoutConfiguredScanPathsReturnsEmpty(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := filepath.Join(home, "project", ".sp")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "20260615-123456-home.md"), []byte("# Home\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := globalSpecMarkdownFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("global files = %#v, want empty without configured scan paths", got)
 	}
 }
 
@@ -896,6 +980,28 @@ func TestTUIRenderUsesPageOffsetAndKeepsOriginalNumbers(t *testing.T) {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("paged render missing %q:\n%s", expected, got)
 		}
+	}
+}
+
+func TestTUIRenderTruncatedSelectedLineDoesNotBleedColor(t *testing.T) {
+	model := tuiModel{
+		files: []specFile{
+			{Name: "20260615-123500-this-title-is-long-enough-to-fill-the-terminal-width.md", Title: "Long"},
+			{Name: "20260615-123459-next.md", Title: "Next"},
+		},
+		selected: 0,
+	}
+
+	got := model.renderList(32, 2, []int{0, 1}, terminalStyle{enabled: true})
+	lines := strings.Split(got, "\r\n")
+	if len(lines) != 2 {
+		t.Fatalf("rendered lines = %#v, want 2 lines", lines)
+	}
+	if !strings.Contains(lines[0], "\x1b[32m") || !strings.Contains(lines[0], "\x1b[0m") {
+		t.Fatalf("selected line should contain green style and reset: %q", lines[0])
+	}
+	if strings.Contains(lines[1], "\x1b[32m") {
+		t.Fatalf("unselected line inherited selected color: %q", lines[1])
 	}
 }
 

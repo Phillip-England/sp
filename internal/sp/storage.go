@@ -89,16 +89,31 @@ func specMarkdownFilesInDir(dir, source string, recentOnly bool) ([]specFile, er
 }
 
 func globalSpecMarkdownFiles() ([]specFile, error) {
-	home, err := os.UserHomeDir()
+	settings, err := loadSystemSettings()
 	if err != nil {
 		return nil, err
 	}
 
-	return globalSpecMarkdownFilesUnder(home)
+	return globalSpecMarkdownFilesUnderPaths(settings.ScanPaths, nil)
 }
 
 func globalSpecMarkdownFilesUnder(root string) ([]specFile, error) {
 	return globalSpecMarkdownFilesUnderWithProgress(root, nil)
+}
+
+func globalSpecMarkdownFilesUnderPaths(paths []string, progress func(string)) ([]specFile, error) {
+	var files []specFile
+	for _, root := range normalizeScanPaths(paths) {
+		rootFiles, err := globalSpecMarkdownFilesUnderWithProgress(root, progress)
+		if err != nil {
+			if strings.Contains(err.Error(), "no .sp markdown files found under") {
+				continue
+			}
+			return nil, err
+		}
+		files = append(files, rootFiles...)
+	}
+	return sortSpecFilesForList(files), nil
 }
 
 func globalSpecMarkdownFilesUnderWithProgress(root string, progress func(string)) ([]specFile, error) {

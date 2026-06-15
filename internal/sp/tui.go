@@ -25,6 +25,7 @@ type tuiModel struct {
 	help        bool
 	mode        tuiMode
 	viewIndexes []int
+	scanPaths   []string
 }
 
 type tuiMode string
@@ -36,6 +37,7 @@ const (
 	tuiModeFind     tuiMode = "find"
 	tuiModeNewTitle tuiMode = "new title"
 	tuiModeNewBody  tuiMode = "new body"
+	tuiModeScanPath tuiMode = "scan path"
 )
 
 func runTUI(args []string) error {
@@ -57,19 +59,30 @@ func runTUI(args []string) error {
 }
 
 func runGlobalTUI() error {
-	home, err := os.UserHomeDir()
+	settings, err := loadSystemSettings()
 	if err != nil {
 		return err
 	}
+	if len(settings.ScanPaths) == 0 {
+		return runTUIWithModel(tuiModel{
+			mode:      tuiModeRead,
+			scanPaths: settings.ScanPaths,
+			message:   "no scan paths configured; press s to add one",
+		})
+	}
 
 	status := newGlobalScanStatus(os.Stderr)
-	status.start(home)
-	files, err := globalSpecMarkdownFilesUnderWithProgress(home, status.progress)
+	status.start(strings.Join(settings.ScanPaths, ", "))
+	files, err := globalSpecMarkdownFilesUnderPaths(settings.ScanPaths, status.progress)
 	if err != nil {
 		return err
 	}
 	status.complete(len(files))
-	return runTUIWithFiles(files)
+	return runTUIWithModel(tuiModel{
+		files:     files,
+		mode:      tuiModeRead,
+		scanPaths: settings.ScanPaths,
+	})
 }
 
 type globalScanStatus struct {
@@ -105,6 +118,14 @@ func formatGlobalScanComplete(count int) string {
 }
 
 func runTUIWithFiles(files []specFile) error {
+	settings, err := loadSystemSettings()
+	if err != nil {
+		return err
+	}
+	return runTUIWithModel(tuiModel{files: files, mode: tuiModeRead, scanPaths: settings.ScanPaths})
+}
+
+func runTUIWithModel(model tuiModel) error {
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return fmt.Errorf("tui requires an interactive terminal: %w", err)
@@ -114,7 +135,6 @@ func runTUIWithFiles(files []specFile) error {
 		fmt.Print("\x1b[?1049l\x1b[?25h")
 	}()
 
-	model := tuiModel{files: files, mode: tuiModeRead}
 	fmt.Print("\x1b[?1049h\x1b[?25l")
 	if err := renderTUI(model); err != nil {
 		return err
@@ -233,6 +253,11 @@ func updateTUI(model tuiModel, key string) (tuiModel, bool) {
 		model.newTitle = ""
 		model.view = false
 		model.message = "new idea title"
+	case "s":
+		model.mode = tuiModeScanPath
+		model.input = ""
+		model.view = false
+		model.message = "add scan path"
 	case "?":
 		model.help = !model.help
 	case "C":
@@ -300,6 +325,16 @@ func applyTUIModeInput(model tuiModel) tuiModel {
 			return model
 		}
 		model = createTUIIdea(model, model.newTitle, body, time.Now)
+	case tuiModeScanPath:
+		settings, normalized, err := addSystemScanPath(model.input)
+		if err != nil {
+			model.message = err.Error()
+			return model
+		}
+		model.scanPaths = settings.ScanPaths
+		model.mode = tuiModeRead
+		model.input = ""
+		model.message = fmt.Sprintf("added scan path %s", normalized)
 	}
 	return model
 }
@@ -360,7 +395,7 @@ func appendTUIInput(model tuiModel, value string) tuiModel {
 		if isTUISelectionText(value) {
 			model.input += value
 		}
-	case tuiModeNewTitle, tuiModeNewBody:
+	case tuiModeNewTitle, tuiModeNewBody, tuiModeScanPath:
 		model.input += value
 	}
 	return model
@@ -544,20 +579,22 @@ func (m tuiModel) render(width, height int, style terminalStyle) string {
 	b.WriteString("\r\n")
 
 	if m.help {
-		help := "q quit  n new  r read  c copy  d delete  f find  enter run  j/k scroll  { } page"
+		help := "q quit  n new  r read  c copy  C copy all  d delete  f find  s scan paths  enter run  j/k scroll  { } page"
 		b.WriteString(fitLine(style.dim(help), width))
 		b.WriteString("\r\n")
 	} else if m.message != "" {
 		b.WriteString(fitLine(style.green(m.message), width))
 		b.WriteString("\r\n")
 	} else {
-		status := "read: type 1 or 1-3 enter  copy: c then 1-3 enter  find: f then type  { } page"
+		status := "read: type 1 or 1-3 enter  copy: c then 1-3 enter  C copy all  find: f then type  s scan paths"
 		if m.view {
 			status = "reading: j/k scroll line  { } page  g top  r list  c copy  d delete  q quit"
 		} else if m.mode == tuiModeNewTitle {
 			status = "new idea: type title then enter  esc cancel"
 		} else if m.mode == tuiModeNewBody {
 			status = "new idea: type text then enter to save  esc cancel"
+		} else if m.mode == tuiModeScanPath {
+			status = "scan paths: type directory then enter  esc cancel"
 		} else if m.mode == tuiModeDelete {
 			status = "delete: type 1 or 1-3 then enter  esc cancel"
 		}
@@ -570,7 +607,9 @@ func (m tuiModel) render(width, height int, style terminalStyle) string {
 		bodyHeight = 1
 	}
 
-	if m.isNewIdeaMode() {
+	if m.mode == tuiModeScanPath {
+		b.WriteString(m.renderScanPaths(width, bodyHeight, style))
+	} else if m.isNewIdeaMode() {
 		b.WriteString(m.renderNewIdea(width, bodyHeight, style))
 	} else if m.view {
 		b.WriteString(m.renderView(width, bodyHeight, visible, style))
@@ -578,6 +617,28 @@ func (m tuiModel) render(width, height int, style terminalStyle) string {
 		b.WriteString(m.renderList(width, bodyHeight, visible, style))
 	}
 
+	return b.String()
+}
+
+func (m tuiModel) renderScanPaths(width, height int, style terminalStyle) string {
+	var b strings.Builder
+	lines := []string{style.boldCyan("Scan paths"), ""}
+	if len(m.scanPaths) == 0 {
+		lines = append(lines, style.dim("No scan paths configured."))
+	} else {
+		for i, path := range m.scanPaths {
+			lines = append(lines, fmt.Sprintf("%d. %s", i+1, path))
+		}
+	}
+	lines = append(lines, "", style.yellow("Add"), m.input)
+	lines = tailLines(lines, height)
+
+	for i := 0; i < min(len(lines), height); i++ {
+		if i > 0 {
+			b.WriteString("\r\n")
+		}
+		b.WriteString(fitLine(lines[i], width))
+	}
 	return b.String()
 }
 
@@ -791,7 +852,7 @@ func (m tuiModel) isNewIdeaMode() bool {
 }
 
 func (m tuiModel) isTextEntryMode() bool {
-	return m.mode == tuiModeFind || m.isNewIdeaMode()
+	return m.mode == tuiModeFind || m.isNewIdeaMode() || m.mode == tuiModeScanPath
 }
 
 func clampTUISelection(model tuiModel, selected int) int {
@@ -829,14 +890,33 @@ func fitLine(value string, width int) string {
 
 	var b strings.Builder
 	used := 0
-	for _, r := range value {
+	hasEscape := false
+	for i := 0; i < len(value); {
+		if value[i] == '\x1b' {
+			hasEscape = true
+			end := i + 1
+			for end < len(value) && value[end] != 'm' {
+				end++
+			}
+			if end < len(value) {
+				end++
+			}
+			b.WriteString(value[i:end])
+			i = end
+			continue
+		}
 		if used >= width-1 {
 			break
 		}
+		r, size := utf8.DecodeRuneInString(value[i:])
 		b.WriteRune(r)
 		used++
+		i += size
 	}
 	b.WriteString("...")
+	if hasEscape {
+		b.WriteString("\x1b[0m")
+	}
 	return b.String()
 }
 
